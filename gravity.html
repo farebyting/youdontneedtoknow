@@ -15,249 +15,1312 @@
   }
   #hud b { color: #9fb0cc; font-weight: 600; }
   #hud .dim { color: #3d4657; }
+  #stats {
+    position: fixed; right: 16px; top: 12px;
+    font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+    color: #55607a; pointer-events: none; user-select: none;
+    text-align: right; text-shadow: 0 0 8px #000;
+  }
+  #stats .big { color: #9fb0cc; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<div id="stats"><span class="big" id="fps">--</span> fps<br><span id="n">0</span> orbs</div>
 <div id="hud">
-  <b>drag</b> fling an orb &nbsp;·&nbsp; <b>click</b> drop one &nbsp;·&nbsp; <b>space</b> pause &nbsp;·&nbsp; <b>c</b> clear
-  <br><span class="dim">they pull on each other. big ones eat small ones.</span>
+  <b>drag</b> fling an orb &nbsp;·&nbsp; <b>click</b> drop one &nbsp;·&nbsp; <b>shift+click</b> heavy &nbsp;·&nbsp; <b>p</b> palette &nbsp;·&nbsp; <b>space</b> pause &nbsp;·&nbsp; <b>c</b> clear
+  <br><span class="dim">they pull on each other. big ones eat small ones. [ ] add / remove orbs</span>
 </div>
 <script>
 (() => {
-  'use strict';
-  const canvas = document.getElementById('c');
-  const ctx = canvas.getContext('2d');
+'use strict';
 
-  let W, H, DPR;
-  function resize() {
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
-    W = window.innerWidth;
-    H = window.innerHeight;
-    canvas.width = W * DPR;
-    canvas.height = H * DPR;
-    canvas.style.width = W + 'px';
-    canvas.style.height = H + 'px';
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+// ===========================================================================
+//  gravity sandbox — WebGL2 renderer + grid-approximated N-body
+//
+//  Two things were slow in the canvas2d version:
+//    * physics was O(n^2), capping the sim at ~220 orbs
+//    * rendering called createRadialGradient() per orb per frame, which is
+//      pure CPU work and dies well before a few thousand orbs
+//
+//  Physics now uses a multilevel uniform grid (an implicit quadtree). Distant
+//  clusters are collapsed to their centre of mass, so cost is ~O(n log n)
+//  instead of O(n^2). Below ~350 orbs the tree costs more than it saves, so it
+//  falls back to the exact all-pairs loop.
+//
+//  Rendering is instanced quads into an HDR float buffer with additive
+//  blending, a bloom chain, and ACES tonemapping. Trails come from fading the
+//  accumulation buffer instead of clearing it.
+// ===========================================================================
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', {
+  alpha: false, antialias: false, depth: false, stencil: false,
+  powerPreference: 'high-performance', preserveDrawingBuffer: false,
+});
+
+if (!gl) {
+  document.body.innerHTML =
+    '<div style="color:#9fb0cc;font:14px monospace;padding:40px">' +
+    'This toy needs WebGL2, which this browser does not seem to have.</div>';
+  return;
+}
+
+const HAS_FLOAT = !!gl.getExtension('EXT_color_buffer_float');
+const HDR_FMT = HAS_FLOAT ? gl.RGBA16F : gl.RGBA8;
+const HDR_TYPE = HAS_FLOAT ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE;
+
+// ---------------------------------------------------------------------------
+//  tunables
+// ---------------------------------------------------------------------------
+const G = 1400;              // gravitational constant
+const SOFTEN = 30;           // softens the force at tiny distances
+const REST = 0.82;           // wall restitution
+const THETA = 0.7;           // grid opening angle (0.5 accurate .. 1.0 loose)
+// Measured crossover between the two physics paths, with collisions included:
+// all-pairs wins to ~400 orbs, the grid wins from ~600 up. 500 sits in the gap.
+// (An earlier value of 900 came from a bench without collisions and was wrong.)
+const DIRECT_LIMIT = 500;
+const NB = 64;               // base grid resolution
+const LEVELS = 7;            // 64 -> 1
+const FADE = 0.94;           // per-frame trail decay
+const MAX_ORBS = 20000;
+
+// A central star dominates the potential. Without it the disc is free-falling:
+// the collapse timescale of a scattered disc is only a fraction of a second, so
+// everything piled into one blob before you could play with it. With a heavy
+// centre the orbs sit on real orbits and the scene holds its shape.
+const STAR_MASS = 9000;
+const STAR_R = Math.pow(STAR_MASS, 1 / 3) * 2.6;
+const ESCAPE_R = 4.0;        // orbs beyond this many screen-heights are dropped
+
+// Collisions. A first version merged on every contact, which is not what a
+// real disc does: gravitational capture needs the pair's relative speed to be
+// below their mutual escape velocity. With merging on all contact, 130 orbs
+// collapsed to 3 in half a minute, because each merge made a bigger orb that
+// swept up neighbours even faster.
+//
+// Now a fast crossing bounces (with some energy loss) and only a slow, gentle
+// catch merges. The disc holds its shape, and mergers become occasional
+// events worth watching instead of constant background churn.
+const CAPTURE = 0.35;        // merge only when v_rel < 0.35 * v_escape
+const RESTITUTION = 0.55;    // bounce energy retention
+const ORB_R_EXP = 1 / 6;     // radius ~ m^(1/6): visible mass, damped cross-section
+
+const PALETTE = [
+  [ 96, 165, 250], [167, 139, 250], [244, 114, 182],
+  [ 52, 211, 153], [251, 191,  36], [248, 113, 113],
+  [ 34, 211, 238],
+];
+
+// Alternate palettes, cycled with P. Orbs store only an index into the first
+// seven slots, so swapping the table recolours everything instantly.
+const PALETTE_SETS = [
+  PALETTE,
+  [ // ember
+    [255, 176,  92], [255, 132,  92], [240,  98, 146],
+    [255, 214, 102], [255, 152,  76], [232,  93,  93],
+    [255, 190, 120],
+  ],
+  [ // ocean
+    [ 86, 204, 242], [ 66, 165, 245], [129, 212, 250],
+    [ 38, 198, 218], [ 77, 182, 172], [126, 178, 255],
+    [100, 181, 246],
+  ],
+  [ // spectral — high contrast, for spotting individual orbits
+    [255,  99, 132], [ 54, 162, 235], [255, 206,  86],
+    [ 75, 192, 192], [153, 102, 255], [255, 159,  64],
+    [ 46, 204, 113],
+  ],
+];
+let paletteIndex = 0;
+const PALETTE_F = PALETTE.map(c => c.map(v => v / 255));
+// slot 7 is the merge flash; slot 8 is the star, given a warm cast so the
+// centre of the frame reads as a light source rather than a grey disc
+const PAL_GL = new Float32Array(9 * 3);
+function applyPalette(i) {
+  paletteIndex = ((i % PALETTE_SETS.length) + PALETTE_SETS.length) % PALETTE_SETS.length;
+  const set = PALETTE_SETS[paletteIndex];
+  for (let k = 0; k < 7; k++) {
+    const c = set[k];
+    PAL_GL[k * 3] = c[0] / 255;
+    PAL_GL[k * 3 + 1] = c[1] / 255;
+    PAL_GL[k * 3 + 2] = c[2] / 255;
   }
-  resize();
-  window.addEventListener('resize', resize);
+  PAL_GL.set([1.00, 0.88, 0.70], 7 * 3);
+  PAL_GL.set([1.00, 0.86, 0.62], 8 * 3);
+}
+applyPalette(0);
+const FLASH_SLOT = 7;
+const STAR_SLOT = 8;
 
-  // --- background stars ---
-  const stars = Array.from({ length: 160 }, () => ({
-    x: Math.random(), y: Math.random(),
-    r: Math.random() * 1.1 + 0.2,
-    a: Math.random() * 0.5 + 0.1,
-  }));
+// ---------------------------------------------------------------------------
+//  gl helpers
+// ---------------------------------------------------------------------------
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(s) + '\n---\n' + src);
+  }
+  return s;
+}
 
-  // --- orbs ---
-  const orbs = [];
-  const G = 1400;          // gravitational constant (tuned to feel good)
-  const MAX_ORBS = 220;
-  const SOFTEN = 30;       // prevents infinite force at tiny distances
+function program(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(p));
+  }
+  return p;
+}
 
-  const PALETTE = [
-    [ 96, 165, 250], [167, 139, 250], [244, 114, 182],
-    [ 52, 211, 153], [251, 191,  36], [248, 113, 113],
-    [ 34, 211, 238],
-  ];
+function uniforms(p, names) {
+  const u = {};
+  for (const n of names) u[n] = gl.getUniformLocation(p, n);
+  return u;
+}
 
-  function massToRadius(m) { return Math.pow(m, 1 / 3) * 2.6; }
+// fullscreen triangle strip
+const QUAD_VBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, QUAD_VBO);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
 
-  function spawn(x, y, vx, vy, mass) {
-    if (orbs.length >= MAX_ORBS) orbs.shift();
-    mass = mass || (4 + Math.random() * 10);
-    const col = PALETTE[(Math.random() * PALETTE.length) | 0];
-    orbs.push({
-      x, y, vx: vx || 0, vy: vy || 0,
-      m: mass, r: massToRadius(mass),
-      col, born: performance.now(),
-    });
+function makeTarget(w, h, fmt, type) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, gl.RGBA, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fbo, w, h };
+}
+
+// ---------------------------------------------------------------------------
+//  shaders
+// ---------------------------------------------------------------------------
+const PARTICLE_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 a_corner;
+layout(location=1) in vec2 a_pos;
+layout(location=2) in vec3 a_data;      // radius, palette index, brightness
+layout(location=3) in float a_glow;     // sprite size multiplier for this orb
+uniform vec2 u_res;
+uniform float u_scale;
+uniform float u_gain;
+uniform vec3 u_pal[9];
+out vec2 v_uv;
+out vec3 v_col;
+void main() {
+  float r = a_data.x;
+  vec3 col = u_pal[int(a_data.y + 0.5)];
+  v_col = col * a_data.z * u_gain;
+  float d = r * a_glow * u_scale * 2.0;
+  vec2 p = a_pos + a_corner * d * 0.5;
+  vec2 clip = (p / u_res) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_uv = a_corner;
+}`;
+
+const PARTICLE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+in vec3 v_col;
+out vec4 outColor;
+void main() {
+  float d = length(v_uv);
+  if (d > 1.0) discard;
+  float core = exp(-d * d * 9.0);
+  float halo = exp(-d * d * 1.7) * 0.30;
+  outColor = vec4(v_col * (core + halo), 1.0);
+}`;
+
+// The fade pass reads the previous accumulation buffer, scales it, and clamps.
+// Clamping matters: with a plain multiply, a static object (the star) reaches a
+// steady state of contribution/(1-fade) ~= 17x and the buffer saturates to
+// solid white. Reading and writing different buffers is what allows the clamp.
+const FADE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_src;
+uniform float u_fade;
+uniform float u_max;
+out vec4 outColor;
+void main() {
+  vec3 c = texture(u_src, v_uv).rgb * u_fade;
+  outColor = vec4(min(c, vec3(u_max)), 1.0);
+}`;
+
+const BLIT_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 a_corner;
+out vec2 v_uv;
+void main() {
+  v_uv = a_corner * 0.5 + 0.5;
+  gl_Position = vec4(a_corner, 0.0, 1.0);
+}`;
+
+const BRIGHT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_src;
+uniform float u_threshold;
+out vec4 outColor;
+void main() {
+  vec3 c = texture(u_src, v_uv).rgb;
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  float k = max(0.0, l - u_threshold) / max(l, 1e-4);
+  outColor = vec4(c * k, 1.0);
+}`;
+
+const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_src;
+uniform vec2 u_dir;          // texel-sized direction
+out vec4 outColor;
+void main() {
+  // 9-tap gaussian
+  float w[5] = float[5](0.227027, 0.194594, 0.121621, 0.054054, 0.016216);
+  vec3 acc = texture(u_src, v_uv).rgb * w[0];
+  for (int i = 1; i < 5; i++) {
+    vec2 o = u_dir * float(i) * 1.6;
+    acc += texture(u_src, v_uv + o).rgb * w[i];
+    acc += texture(u_src, v_uv - o).rgb * w[i];
+  }
+  outColor = vec4(acc, 1.0);
+}`;
+
+const TONEMAP_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_scene;
+uniform sampler2D u_bloom;
+uniform sampler2D u_stars;
+uniform vec2 u_res;
+uniform float u_bloomAmt;
+uniform float u_shake;
+uniform float u_time;
+uniform float u_exposure;
+uniform float u_starAmt;
+out vec4 outColor;
+
+// ACES-ish filmic curve: keeps highlights from clipping to flat white
+vec3 tonemap(vec3 x) {
+  const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+  vec2 uv = v_uv;
+  // subtle screen shake on big merges
+  if (u_shake > 0.0) {
+    float s = u_shake * 0.004;
+    uv += vec2(sin(u_time * 91.0), cos(u_time * 77.0)) * s;
   }
 
-  // seed a few so it's alive on open
-  for (let i = 0; i < 7; i++) {
-    spawn(W * (0.2 + 0.6 * Math.random()), H * (0.2 + 0.6 * Math.random()),
-          (Math.random() - 0.5) * 60, (Math.random() - 0.5) * 60,
-          5 + Math.random() * 14);
-  }
+  vec3 col = texture(u_scene, uv).rgb;
+  col += texture(u_bloom, uv).rgb * u_bloomAmt;
 
-  // --- interaction ---
-  let drag = null;       // {x, y, cx, cy}
-  let paused = false;
+  // starfield is baked into a texture at resize: one fetch, not ~40 hash ops
+  float tw = 0.85 + 0.15 * sin(u_time * 2.0);
+  col += texture(u_stars, uv).rgb * tw * u_starAmt;
 
-  function pos(e) {
-    const t = e.touches ? e.touches[0] : e;
-    return { x: t.clientX, y: t.clientY };
-  }
+  col = tonemap(col * u_exposure);
+  col = pow(col, vec3(1.0 / 2.2));   // linear -> sRGB
+  outColor = vec4(col, 1.0);
+}`;
 
-  function down(e) {
-    e.preventDefault();
-    const p = pos(e);
-    drag = { x: p.x, y: p.y, cx: p.x, cy: p.y, t: performance.now() };
-  }
-  function move(e) {
-    if (!drag) return;
-    e.preventDefault();
-    const p = pos(e);
-    drag.cx = p.x; drag.cy = p.y;
-  }
-  function up(e) {
-    if (!drag) return;
-    e.preventDefault();
-    const dx = drag.x - drag.cx;
-    const dy = drag.y - drag.cy;
-    const dt = Math.max((performance.now() - drag.t) / 1000, 0.05);
-    const dist = Math.hypot(dx, dy);
+const progParticle = program(PARTICLE_VS, PARTICLE_FS);
+const uParticle = uniforms(progParticle, ['u_res', 'u_scale', 'u_gain', 'u_pal']);
+const progFade = program(BLIT_VS, FADE_FS);
+const uFade = uniforms(progFade, ['u_src', 'u_fade', 'u_max']);
+const progBright = program(BLIT_VS, BRIGHT_FS);
+const uBright = uniforms(progBright, ['u_src', 'u_threshold']);
+const progBlur = program(BLIT_VS, BLUR_FS);
+const uBlur = uniforms(progBlur, ['u_src', 'u_dir']);
+const progTonemap = program(BLIT_VS, TONEMAP_FS);
+const uTonemap = uniforms(progTonemap, ['u_scene', 'u_bloom', 'u_stars', 'u_res', 'u_bloomAmt', 'u_shake', 'u_time', 'u_exposure', 'u_starAmt']);
 
-    if (dist < 6) {
-      spawn(drag.x, drag.y, 0, 0, 6 + Math.random() * 10);
+// ---------------------------------------------------------------------------
+//  particle instance buffer
+// ---------------------------------------------------------------------------
+const FLOATS_PER_INSTANCE = 6;      // x, y, radius, palette index, brightness, glow
+const INSTANCE_STRIDE = FLOATS_PER_INSTANCE * 4;
+const MAX_INSTANCES = MAX_ORBS + 4096;
+const instData = new Float32Array(MAX_INSTANCES * FLOATS_PER_INSTANCE);
+const instVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, instVBO);
+gl.bufferData(gl.ARRAY_BUFFER, instData.byteLength, gl.DYNAMIC_DRAW);
+
+const QUAD_CORNERS = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+const cornerVBO = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, cornerVBO);
+gl.bufferData(gl.ARRAY_BUFFER, QUAD_CORNERS, gl.STATIC_DRAW);
+
+const VAO = gl.createVertexArray();
+gl.bindVertexArray(VAO);
+gl.bindBuffer(gl.ARRAY_BUFFER, cornerVBO);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindBuffer(gl.ARRAY_BUFFER, instVBO);
+gl.enableVertexAttribArray(1);
+gl.vertexAttribPointer(1, 2, gl.FLOAT, false, INSTANCE_STRIDE, 0);
+gl.vertexAttribDivisor(1, 1);
+gl.enableVertexAttribArray(2);
+gl.vertexAttribPointer(2, 3, gl.FLOAT, false, INSTANCE_STRIDE, 8);
+gl.vertexAttribDivisor(2, 1);
+gl.enableVertexAttribArray(3);
+gl.vertexAttribPointer(3, 1, gl.FLOAT, false, INSTANCE_STRIDE, 20);
+gl.vertexAttribDivisor(3, 1);
+gl.bindVertexArray(null);
+
+// ---------------------------------------------------------------------------
+//  render targets
+// ---------------------------------------------------------------------------
+let W = 1, H = 1, DPR = 1;
+let sceneA = null, sceneB = null, bloomA = null, bloomB = null, starTex = null;
+let accum = 0;      // which of sceneA/sceneB holds the current accumulation
+
+// Bake the starfield once per resize. Doing this per-pixel per-frame in the
+// tonemap shader cost far more than it was worth on integrated graphics.
+function buildStars(w, h) {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const sc = c.getContext('2d');
+  sc.fillStyle = '#000';
+  sc.fillRect(0, 0, w, h);
+
+  const count = Math.floor((w * h) / 5200);
+  for (let i = 0; i < count; i++) {
+    const x = Math.random() * w;
+    const y = Math.random() * h;
+    const b = Math.random();
+
+    // a few bright stars get a soft glow, the rest are faint pinpricks
+    if (b > 0.985) {
+      const r = 1.6 + Math.random() * 2.4;
+      const g = sc.createRadialGradient(x, y, 0, x, y, r * 3.5);
+      g.addColorStop(0.0, 'rgba(215,228,255,0.95)');
+      g.addColorStop(0.3, 'rgba(150,180,235,0.35)');
+      g.addColorStop(1.0, 'rgba(90,120,180,0)');
+      sc.fillStyle = g;
+      sc.beginPath(); sc.arc(x, y, r * 3.5, 0, 6.2832); sc.fill();
     } else {
-      // slingshot: pull back, launch forward
-      const speed = Math.min(dist * 2.2, 900);
-      spawn(drag.x, drag.y, (dx / dist) * speed, (dy / dist) * speed,
-            6 + Math.min(dist, 200) * 0.08);
+      const a = 0.10 + b * 0.45;
+      sc.fillStyle = 'rgba(190,208,240,' + a.toFixed(3) + ')';
+      const s = b > 0.9 ? 1.6 : 1.0;
+      sc.fillRect(x, y, s, s);
     }
-    drag = null;
   }
 
-  canvas.addEventListener('mousedown', down);
-  canvas.addEventListener('mousemove', move);
-  window.addEventListener('mouseup', up);
-  canvas.addEventListener('touchstart', down, { passive: false });
-  canvas.addEventListener('touchmove', move, { passive: false });
-  window.addEventListener('touchend', up, { passive: false });
+  if (starTex) gl.deleteTexture(starTex);
+  starTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, starTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.bindTexture(gl.TEXTURE_2D, null);
+}
 
-  window.addEventListener('keydown', e => {
-    if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
-    if (e.key === 'c' || e.key === 'C') orbs.length = 0;
+function allocateTargets() {
+  DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+  W = Math.max(1, Math.floor(window.innerWidth * DPR));
+  H = Math.max(1, Math.floor(window.innerHeight * DPR));
+  canvas.width = W;
+  canvas.height = H;
+  canvas.style.width = window.innerWidth + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+
+  if (sceneA) { gl.deleteTexture(sceneA.tex); gl.deleteFramebuffer(sceneA.fbo); }
+  if (sceneB) { gl.deleteTexture(sceneB.tex); gl.deleteFramebuffer(sceneB.fbo); }
+  if (bloomA) { gl.deleteTexture(bloomA.tex); gl.deleteFramebuffer(bloomA.fbo); }
+  if (bloomB) { gl.deleteTexture(bloomB.tex); gl.deleteFramebuffer(bloomB.fbo); }
+
+  sceneA = makeTarget(W, H, HDR_FMT, HDR_TYPE);
+  sceneB = makeTarget(W, H, HDR_FMT, HDR_TYPE);
+  accum = 0;
+  const bw = Math.max(1, W >> 2), bh = Math.max(1, H >> 2);
+  bloomA = makeTarget(bw, bh, HDR_FMT, HDR_TYPE);
+  bloomB = makeTarget(bw, bh, HDR_FMT, HDR_TYPE);
+
+  buildStars(W, H);
+
+  // clear both accumulation buffers to black
+  gl.clearColor(0, 0, 0, 1);
+  for (const t of [sceneA, sceneB]) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+function drawFullscreen() {
+  gl.bindBuffer(gl.ARRAY_BUFFER, QUAD_VBO);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ---------------------------------------------------------------------------
+//  physics
+// ---------------------------------------------------------------------------
+const orbs = [];
+const flashes = [];
+let nextId = 1;
+
+// Reference radius used for seeding, and the growth law for merged orbs.
+const BASE_MASS = 12;
+const BASE_R = 4.2;
+function massToRadius(m) { return BASE_R * Math.pow(m / BASE_MASS, ORB_R_EXP); }
+
+function spawn(x, y, vx, vy, mass, opts) {
+  if (orbs.length >= MAX_ORBS) orbs.shift();
+  mass = mass || (4 + Math.random() * 10);
+  const o = {
+    x, y, vx: vx || 0, vy: vy || 0,
+    m: mass, r: massToRadius(mass),
+    ci: (Math.random() * PALETTE.length) | 0,
+    born: performance.now(),
+    id: nextId++,
+    star: false,
+    pinned: false,
+  };
+  if (opts && opts.star) {
+    o.star = true;
+    o.pinned = true;        // the star is the inertial frame: it does not drift
+    o.ci = STAR_SLOT;
+    o.r = STAR_R;
+  }
+  orbs.push(o);
+  return o;
+}
+
+// --- grid ------------------------------------------------------------------
+const grid = {
+  lv: [],
+  cellOf: new Int32Array(MAX_ORBS),
+  sorted: new Int32Array(MAX_ORBS),
+  counts: new Int32Array(NB * NB),
+  starts: new Int32Array(NB * NB + 1),
+  cursor: new Int32Array(NB * NB),
+};
+for (let l = 0; l < LEVELS; l++) {
+  const res = NB >> l, cells = res * res;
+  grid.lv.push({
+    res, cells,
+    mass: new Float64Array(cells),
+    cx: new Float64Array(cells),
+    cy: new Float64Array(cells),
   });
+}
 
-  // --- physics ---
-  function step(dt) {
-    const n = orbs.length;
+function buildGrid() {
+  const n = orbs.length;
+  const l0 = grid.lv[0];
+  l0.mass.fill(0); l0.cx.fill(0); l0.cy.fill(0);
+  grid.counts.fill(0);
 
-    // pairwise gravity
-    for (let i = 0; i < n; i++) {
-      const a = orbs[i];
-      for (let j = i + 1; j < n; j++) {
-        const b = orbs[j];
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const d2 = dx * dx + dy * dy + SOFTEN;
-        const d = Math.sqrt(d2);
-        const f = G / d2;
-        const fx = f * dx / d, fy = f * dy / d;
-        a.vx += fx * b.m * dt; a.vy += fy * b.m * dt;
-        b.vx -= fx * a.m * dt; b.vy -= fy * a.m * dt;
+  const invW = NB / W, invH = NB / H;
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    let cx = (o.x * invW) | 0; if (cx < 0) cx = 0; else if (cx >= NB) cx = NB - 1;
+    let cy = (o.y * invH) | 0; if (cy < 0) cy = 0; else if (cy >= NB) cy = NB - 1;
+    const c = cy * NB + cx;
+    grid.cellOf[i] = c;
+    grid.counts[c]++;
+    l0.mass[c] += o.m;
+    l0.cx[c] += o.x * o.m;
+    l0.cy[c] += o.y * o.m;
+  }
+
+  // counting sort so leaf cells hold contiguous runs (merge pass needs this)
+  const st = grid.starts;
+  let acc = 0;
+  for (let c = 0; c < NB * NB; c++) { st[c] = acc; acc += grid.counts[c]; }
+  st[NB * NB] = acc;
+  grid.cursor.set(st.subarray(0, NB * NB));
+  for (let i = 0; i < n; i++) grid.sorted[grid.cursor[grid.cellOf[i]]++] = i;
+
+  for (let c = 0; c < l0.cells; c++) {
+    const m = l0.mass[c];
+    if (m > 0) { l0.cx[c] /= m; l0.cy[c] /= m; }
+  }
+
+  for (let l = 1; l < LEVELS; l++) {
+    const L = grid.lv[l], P = grid.lv[l - 1];
+    const res = L.res, pres = P.res;
+    L.mass.fill(0); L.cx.fill(0); L.cy.fill(0);
+    for (let y = 0; y < res; y++) {
+      for (let x = 0; x < res; x++) {
+        let m = 0, sx = 0, sy = 0;
+        const r0 = (y * 2) * pres + x * 2;
+        for (let k = 0; k < 4; k++) {
+          const pc = r0 + ((k >> 1) ? pres : 0) + (k & 1);
+          const pm = P.mass[pc];
+          if (pm > 0) { m += pm; sx += P.cx[pc] * pm; sy += P.cy[pc] * pm; }
+        }
+        const c = y * res + x;
+        L.mass[c] = m;
+        if (m > 0) { L.cx[c] = sx / m; L.cy[c] = sy / m; }
       }
     }
+  }
+}
 
-    // integrate + walls
-    const REST = 0.82;
-    for (let i = 0; i < n; i++) {
-      const o = orbs[i];
-      o.x += o.vx * dt;
-      o.y += o.vy * dt;
-      if (o.x - o.r < 0)      { o.x = o.r;     o.vx = Math.abs(o.vx) * REST; }
-      if (o.x + o.r > W)      { o.x = W - o.r; o.vx = -Math.abs(o.vx) * REST; }
-      if (o.y - o.r < 0)      { o.y = o.r;     o.vy = Math.abs(o.vy) * REST; }
-      if (o.y + o.r > H)      { o.y = H - o.r; o.vy = -Math.abs(o.vy) * REST; }
+const stackN = new Int32Array(8192);
+
+function gridForces(dt) {
+  const n = orbs.length;
+  const th2 = THETA * THETA;
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    if (o.pinned) continue;
+    let ax = 0, ay = 0, sp = 0;
+    stackN[sp++] = (LEVELS - 1) << 12;
+    while (sp > 0) {
+      const node = stackN[--sp];
+      const l = node >> 12;
+      const ix = node & 63, iy = (node >> 6) & 63;
+      const L = grid.lv[l];
+      const c = iy * L.res + ix;
+      const m = L.mass[c];
+      if (m === 0) continue;
+      const dx = L.cx[c] - o.x, dy = L.cy[c] - o.y;
+      const d2 = dx * dx + dy * dy + SOFTEN;
+      const size = W / L.res;
+      if (size * size < th2 * d2) {
+        // far enough away: treat the whole cell as one point mass
+        const inv = 1 / Math.sqrt(d2);
+        const f = G * m * inv / d2;
+        ax += f * dx; ay += f * dy;
+      } else if (l === 0) {
+        // leaf: exact pairwise, skipping self
+        const s = grid.starts[c], e = grid.starts[c + 1];
+        for (let k = s; k < e; k++) {
+          const j = grid.sorted[k];
+          if (j === i) continue;
+          const b = orbs[j];
+          const bx = b.x - o.x, by = b.y - o.y;
+          const bd2 = bx * bx + by * by + SOFTEN;
+          const binv = 1 / Math.sqrt(bd2);
+          const bf = G * b.m * binv / bd2;
+          ax += bf * bx; ay += bf * by;
+        }
+      } else {
+        const nl = l - 1, pres = L.res * 2;
+        const bx2 = ix * 2, by2 = iy * 2;
+        stackN[sp++] = (nl << 12) | (by2 << 6) | bx2;
+        stackN[sp++] = (nl << 12) | (by2 << 6) | (bx2 + 1);
+        stackN[sp++] = (nl << 12) | ((by2 + 1) << 6) | bx2;
+        stackN[sp++] = (nl << 12) | ((by2 + 1) << 6) | (bx2 + 1);
+      }
+    }
+    o.vx += ax * dt; o.vy += ay * dt;
+  }
+}
+function directForces(dt) {
+  const n = orbs.length;
+  for (let i = 0; i < n; i++) {
+    const a = orbs[i];
+    for (let j = i + 1; j < n; j++) {
+      const b = orbs[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const d2 = dx * dx + dy * dy + SOFTEN;
+      const d = Math.sqrt(d2);
+      const f = G / d2;
+      const fx = f * dx / d, fy = f * dy / d;
+      if (!a.pinned) { a.vx += fx * b.m * dt; a.vy += fy * b.m * dt; }
+      if (!b.pinned) { b.vx -= fx * a.m * dt; b.vy -= fy * a.m * dt; }
+    }
+  }
+}
+
+function integrate(dt) {
+  const n = orbs.length;
+  const cx = W * 0.5, cy = H * 0.5;
+  const esc = Math.max(W, H) * ESCAPE_R;
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    if (o.pinned) continue;          // the star holds position
+    o.x += o.vx * dt;
+    o.y += o.vy * dt;
+
+    // Wall bounce is for the star's neighbourhood only. An orb slingshot past
+    // the edge should leave, not ricochet off an invisible box, so once it is
+    // well outside it is retired.
+    const dx = o.x - cx, dy = o.y - cy;
+    if (dx * dx + dy * dy > esc * esc) {
+      o.dead = true;
+      continue;
     }
 
-    // merge on overlap (momentum conserved)
-    for (let i = 0; i < orbs.length; i++) {
-      for (let j = i + 1; j < orbs.length; j++) {
-        const a = orbs[i], b = orbs[j];
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const rr = (a.r + b.r) * 0.82;
-        if (dx * dx + dy * dy < rr * rr) {
-          const M = a.m + b.m;
-          a.vx = (a.vx * a.m + b.vx * b.m) / M;
-          a.vy = (a.vy * a.m + b.vy * b.m) / M;
-          a.x = (a.x * a.m + b.x * b.m) / M;
-          a.y = (a.y * a.m + b.y * b.m) / M;
-          a.m = M;
-          a.r = massToRadius(M);
-          orbs.splice(j, 1);
-          j--;
+    if (o.x - o.r < 0) { o.x = o.r;     o.vx =  Math.abs(o.vx) * REST; }
+    if (o.x + o.r > W) { o.x = W - o.r; o.vx = -Math.abs(o.vx) * REST; }
+    if (o.y - o.r < 0) { o.y = o.r;     o.vy =  Math.abs(o.vy) * REST; }
+    if (o.y + o.r > H) { o.y = H - o.r; o.vy = -Math.abs(o.vy) * REST; }
+  }
+}
+
+// drop anything that left the arena
+function cullEscaped() {
+  let w = 0;
+  for (let i = 0; i < orbs.length; i++) {
+    if (!orbs[i].dead) orbs[w++] = orbs[i];
+  }
+  if (w !== orbs.length) orbs.length = w;
+}
+
+// ---------------------------------------------------------------------------
+//  collisions
+//
+//  Two outcomes, decided by the pair's relative speed:
+//    * slow (v_rel < escape velocity)  -> merge, with a flash
+//    * fast                            -> bounce, losing some energy
+//  A star always absorbs whatever touches it.
+// ---------------------------------------------------------------------------
+function absorb(big, small) {
+  const M = big.m + small.m;
+  if (!big.pinned) {
+    big.vx = (big.vx * big.m + small.vx * small.m) / M;
+    big.vy = (big.vy * big.m + small.vy * small.m) / M;
+    big.x = (big.x * big.m + small.x * small.m) / M;
+    big.y = (big.y * big.m + small.y * small.m) / M;
+  }
+  const wasR = big.r;
+  big.m = M;
+  // Radius grows slower than mass (m^1/6 rather than m^1/3). Physically this is
+  // a denser body; mechanically it stops the runaway where each merge widens
+  // the orb's cross-section and speeds up the next merge. The star grows slower
+  // still, so feeding it stays visible without it swallowing the screen.
+  if (big.star) big.r = STAR_R * Math.pow(M / STAR_MASS, 1 / 9);
+  else big.r = massToRadius(M);
+
+  flashes.push({
+    x: big.x, y: big.y,
+    r: (big.r + wasR) * 0.5,
+    life: 1, decay: 2.6, grow: 3.4,
+  });
+  if (small.m > 14) shake = Math.min(shake + small.m / 260, 0.55);
+}
+
+function bounce(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const d = Math.sqrt(dx * dx + dy * dy) || 0.001;
+  const nx = dx / d, ny = dy / d;
+
+  const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+  const vn = rvx * nx + rvy * ny;
+  if (vn > 0) return;                     // already separating
+
+  const ima = a.pinned ? 0 : 1 / a.m;
+  const imb = b.pinned ? 0 : 1 / b.m;
+  const inv = ima + imb;
+  if (inv === 0) return;
+
+  const j = -(1 + RESTITUTION) * vn / inv;
+  if (!a.pinned) { a.vx -= j * ima * nx; a.vy -= j * ima * ny; }
+  if (!b.pinned) { b.vx += j * imb * nx; b.vy += j * imb * ny; }
+
+  // separate the overlap so they do not stick together
+  const overlap = (a.r + b.r) - d;
+  if (overlap > 0) {
+    if (a.pinned) { b.x += nx * overlap; b.y += ny * overlap; }
+    else if (b.pinned) { a.x -= nx * overlap; a.y -= ny * overlap; }
+    else {
+      const wa = imb / inv, wb = ima / inv;
+      a.x -= nx * overlap * wa; a.y -= ny * overlap * wa;
+      b.x += nx * overlap * wb; b.y += ny * overlap * wb;
+    }
+  }
+}
+
+function collidePair(a, b, dead, i, j) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const sum = a.r + b.r;
+  if (dx * dx + dy * dy >= sum * sum) return false;   // no contact at all
+
+  if (a.star || b.star) {
+    const big = a.star ? a : b;
+    const small = a.star ? b : a;
+    absorb(big, small);
+    dead[small === a ? i : j] = true;
+    return true;
+  }
+
+  const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+  const vrel2 = rvx * rvx + rvy * rvy;
+  const vEsc = Math.sqrt(2 * G * (a.m + b.m) / sum);
+
+  if (vrel2 < vEsc * vEsc * CAPTURE * CAPTURE) {
+    const big = a.m >= b.m ? a : b;
+    const small = a.m >= b.m ? b : a;
+    absorb(big, small);
+    dead[small === a ? i : j] = true;
+    return true;
+  }
+
+  bounce(a, b);
+  return false;
+}
+
+// grid path: only a 3x3 block of leaf cells can hold a contact, so this is O(n)
+// Preallocated: a fresh Uint8Array every frame is a needless allocation, and
+// the collision pass runs on every step.
+const deadFlags = new Uint8Array(MAX_ORBS + 64);
+
+function collidePass() {
+  const n = orbs.length;
+  const dead = deadFlags;
+  dead.fill(0, 0, n);
+  let anyGone = false;
+
+  for (let i = 0; i < n; i++) {
+    if (dead[i]) continue;
+    const a = orbs[i];
+    const ci = grid.cellOf[i];
+    const cxi = ci % NB, cyi = (ci / NB) | 0;
+
+    for (let oy = -1; oy <= 1; oy++) {
+      const yy = cyi + oy;
+      if (yy < 0 || yy >= NB) continue;
+      for (let ox = -1; ox <= 1; ox++) {
+        const xx = cxi + ox;
+        if (xx < 0 || xx >= NB) continue;
+        const c = yy * NB + xx;
+        const s = grid.starts[c], e = grid.starts[c + 1];
+        for (let k = s; k < e; k++) {
+          const j = grid.sorted[k];
+          if (j <= i || dead[j]) continue;
+          if (collidePair(a, orbs[j], dead, i, j)) {
+            anyGone = true;
+            if (dead[i]) { oy = 2; break; }   // a is gone, stop scanning
+          }
         }
       }
     }
   }
 
-  // --- render ---
-  function draw(now) {
-    // motion-blur fade: paint bg at low alpha instead of clearing
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = 'rgba(5, 6, 10, 0.28)';
-    ctx.fillRect(0, 0, W, H);
+  if (anyGone) {
+    let w = 0;
+    for (let i = 0; i < n; i++) if (!dead[i]) orbs[w++] = orbs[i];
+    orbs.length = w;
+  }
+}
 
-    // stars (redrawn dim, they smear slightly = dreamy)
-    for (const s of stars) {
-      ctx.globalAlpha = s.a * 0.55;
-      ctx.fillStyle = '#c8d6f0';
-      ctx.fillRect(s.x * W, s.y * H, s.r, s.r);
+// small-count path: no grid, so compare all pairs
+function collideDirect() {
+  for (let i = 0; i < orbs.length; i++) {
+    for (let j = i + 1; j < orbs.length; j++) {
+      const a = orbs[i], b = orbs[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const sum = a.r + b.r;
+      if (dx * dx + dy * dy >= sum * sum) continue;   // no contact at all
+
+      if (a.star || b.star) {
+        const big = a.star ? a : b;
+        const small = a.star ? b : a;
+        absorb(big, small);
+        if (small === a) { orbs.splice(i, 1); i--; break; }
+        orbs.splice(j, 1); j--;
+        continue;
+      }
+
+      const rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+      const vrel2 = rvx * rvx + rvy * rvy;
+      const vEsc = Math.sqrt(2 * G * (a.m + b.m) / sum);
+
+      if (vrel2 < vEsc * vEsc * CAPTURE * CAPTURE) {
+        const big = a.m >= b.m ? a : b;
+        const small = a.m >= b.m ? b : a;
+        absorb(big, small);
+        if (small === a) { orbs.splice(i, 1); i--; break; }
+        orbs.splice(j, 1); j--;
+      } else {
+        bounce(a, b);
+      }
     }
-    ctx.globalAlpha = 1;
+  }
+}
 
-    // orbs, additive glow
-    ctx.globalCompositeOperation = 'lighter';
+// ---------------------------------------------------------------------------
+//  interaction
+// ---------------------------------------------------------------------------
+let drag = null, paused = false, shake = 0, simTime = 0;
+let lastInstanceCount = 0;
+let seedCount = 130;
+
+// render parameters, adjustable at runtime for tuning.
+// These values came from sweeping with an in-page framebuffer probe: at the
+// original gain the whole frame sat above 240 and the image was a white wash.
+// 0.07 keeps the background near-black while the star and orbs stay bright.
+let tuneFade = FADE;
+let tuneGain = 0.07;
+let tuneBloom = 0.30;
+let tuneClamp = 1.2;
+let tuneExposure = 0.90;
+let tuneStars = 1.0;
+let tuneBloomOn = true;
+
+// The disc thins as orbs merge or get absorbed. The trickle below tops it back
+// up so the scene never settles into an empty screen, and keeps the star fed.
+let trickleAcc = 0;
+
+function pos(e) {
+  const t = e.touches ? e.touches[0] : e;
+  return { x: t.clientX * DPR, y: t.clientY * DPR };
+}
+
+function down(e) {
+  e.preventDefault();
+  const p = pos(e);
+  drag = { x: p.x, y: p.y, cx: p.x, cy: p.y, t: performance.now(), heavy: !!e.shiftKey };
+}
+function move(e) {
+  if (!drag) return;
+  e.preventDefault();
+  const p = pos(e);
+  drag.cx = p.x; drag.cy = p.y;
+}
+function up(e) {
+  if (!drag) return;
+  e.preventDefault();
+  const dx = drag.x - drag.cx, dy = drag.y - drag.cy;
+  const dist = Math.hypot(dx, dy);
+  const heavy = drag.heavy;
+
+  if (dist < 6) {
+    spawn(drag.x, drag.y, 0, 0, heavy ? 60 : 6 + Math.random() * 10);
+  } else {
+    const speed = Math.min(dist * 2.2, 900);
+    const mass = (heavy ? 55 : 6) + Math.min(dist, 200) * 0.08;
+    spawn(drag.x, drag.y, (dx / dist) * speed, (dy / dist) * speed, mass);
+  }
+  drag = null;
+}
+
+canvas.addEventListener('mousedown', down);
+canvas.addEventListener('mousemove', move);
+window.addEventListener('mouseup', up);
+canvas.addEventListener('touchstart', down, { passive: false });
+canvas.addEventListener('touchmove', move, { passive: false });
+window.addEventListener('touchend', up, { passive: false });
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+  if (e.key === 'c' || e.key === 'C') { orbs.length = 0; flashes.length = 0; }
+  if (e.key === ']') for (let i = 0; i < 40; i++) seedOrb();
+  if (e.key === '[') orbs.splice(0, 40);
+  if (e.key === 'p' || e.key === 'P') applyPalette(paletteIndex + 1);
+});
+
+// Seed a disc of orbs on circular orbits around the star. The speed follows
+// from the orbit condition for a softened potential:
+//
+//     v^2 / r = G*M*r / (r^2 + SOFTEN)^(3/2)
+//
+// A first attempt used a linear mass-enclosed guess, which left the rim ~18%
+// slow; everything spiralled in and merged within a second. Using the actual
+// force law keeps the disc together and the orbs passing each other.
+function orbitSpeed(r) {
+  const d2 = r * r + SOFTEN;
+  return Math.sqrt(G * STAR_MASS * r * r / (d2 * Math.sqrt(d2)));
+}
+
+function seedOrbAt(ang, rr, opts) {
+  const cx = W * 0.5, cy = H * 0.5;
+  const x = cx + Math.cos(ang) * rr;
+  const y = cy + Math.sin(ang) * rr;
+  const m = (opts && opts.mass) || (5 + Math.random() * 14);
+
+  // tangential direction, plus a little jitter so orbits are ellipses and the
+  // disc slowly mixes instead of staying perfectly circular. Kept small: too
+  // much jitter makes every orbit cross every other one and the disc shreds
+  // itself through constant collisions.
+  const tx = -Math.sin(ang), ty = Math.cos(ang);
+  const v = orbitSpeed(rr) * (0.96 + Math.random() * 0.08);
+  const jx = (Math.random() - 0.5) * v * 0.04;
+  const jy = (Math.random() - 0.5) * v * 0.04;
+
+  spawn(x, y, tx * v + jx, ty * v + jy, m, opts);
+}
+
+function seedOrb() {
+  const rmax = Math.min(W, H) * 0.44;
+  seedOrbAt(Math.random() * Math.PI * 2, rmax * (0.16 + 0.84 * Math.random()));
+}
+function seedDisc(count) {
+  // star first, so it exists before anything else is placed
+  orbs.length = 0;
+  flashes.length = 0;
+  seedCount = count;
+  trickleAcc = 0;
+  spawn(W * 0.5, H * 0.5, 0, 0, STAR_MASS, { star: true });
+
+  const rmax = Math.min(W, H) * 0.44;
+  const inner = STAR_R * 2.6;
+  for (let i = 0; i < count; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    // sqrt spacing fills the annulus evenly rather than clustering inside
+    const t = Math.sqrt(Math.random());
+    const rr = inner + (rmax - inner) * t;
+    seedOrbAt(ang, rr);
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  debug handle (used by the automated checks; harmless in normal play)
+// ---------------------------------------------------------------------------
+window.__g = {
+  state: () => ({
+    orbs: orbs.length,
+    fps: fpsShown,
+    paused,
+    flashes: flashes.length,
+    instances: lastInstanceCount,
+  }),
+  seed: (n) => seedDisc(n || 110),
+  clear: () => { orbs.length = 0; flashes.length = 0; },
+  setCount: (n) => {
+    while (orbs.length > n) orbs.pop();
+    while (orbs.length < n) seedOrb();
+  },
+  spawn: (x, y, vx, vy, m) => spawn(x, y, vx, vy, m),
+  step: (dt) => step(dt || DT),
+  // force one path or the other, so the crossover is measured not guessed
+  stepDirectOnly: (dt) => {
+    const d = dt || DT;
+    directForces(d); integrate(d); cullEscaped(); collideDirect(); trickle(d);
+  },
+  stepGridOnly: (dt) => {
+    const d = dt || DT;
+    buildGrid(); gridForces(d); integrate(d); cullEscaped(); collidePass(); trickle(d);
+  },
+  // step the sim N times with no rendering, so physics cost is measured
+  // independently of frame pacing
+  stepMany: (n, dt) => {
+    const t0 = performance.now();
+    for (let i = 0; i < n; i++) step(dt || DT);
+    return performance.now() - t0;
+  },
+  // render once and block until the GPU is done, so render cost is real
+  renderOnce: () => {
+    const t0 = performance.now();
+    render(performance.now());
+    gl.finish();
+    return performance.now() - t0;
+  },
+  counts: () => orbs.map((o) => o.m),
+  // live tuning handle, so visual parameters can be swept without editing the
+  // file and reloading for each value
+  tune: (o) => {
+    if (o.fade !== undefined) tuneFade = o.fade;
+    if (o.gain !== undefined) tuneGain = o.gain;
+    if (o.bloom !== undefined) tuneBloom = o.bloom;
+    if (o.clamp !== undefined) tuneClamp = o.clamp;
+    if (o.exposure !== undefined) tuneExposure = o.exposure;
+    if (o.stars !== undefined) tuneStars = o.stars;
+    if (o.bloomOn !== undefined) tuneBloomOn = o.bloomOn;
+  },
+  tuneState: () => ({ fade: tuneFade, gain: tuneGain, bloom: tuneBloom, clamp: tuneClamp, exposure: tuneExposure, stars: tuneStars, bloomOn: tuneBloomOn }),
+  // Reset the accumulation buffers. Without this, a saturated buffer persists
+  // between measurements: decay from the clamp ceiling takes ~56 frames, so a
+  // probe run straight after a bright configuration reports a white image that
+  // has nothing to do with the parameters under test.
+  resetAccum: () => {
+    gl.clearColor(0, 0, 0, 1);
+    for (const t of [sceneA, sceneB]) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  },
+  // Render, then read the framebuffer immediately in the same task, before the
+  // compositor can swap or clear it. Returns image statistics so visual
+  // parameters can be swept without screenshots or a PNG decoder.
+  probe: (settleFrames) => {
+    const frames = settleFrames || 1;
+    for (let i = 0; i < frames; i++) render(performance.now());
+    const w = W, h = H;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    let sum = 0, white = 0, black = 0, mid = 0, mx = 0;
+    const total = w * h;
+    for (let i = 0; i < px.length; i += 4) {
+      const l = (px[i] + px[i + 1] + px[i + 2]) / 3;
+      sum += l;
+      if (l > 235) white++;
+      else if (l < 14) black++;
+      else if (l > 60 && l < 190) mid++;
+      if (l > mx) mx = l;
+    }
+    return {
+      mean: sum / total,
+      pctWhite: 100 * white / total,
+      pctBlack: 100 * black / total,
+      pctMid: 100 * mid / total,
+      max: mx,
+      centre: [px[((h >> 1) * w + (w >> 1)) * 4], px[((h >> 1) * w + (w >> 1)) * 4 + 1], px[((h >> 1) * w + (w >> 1)) * 4 + 2]],
+    };
+  },
+  palette: () => paletteIndex,
+  setPalette: (i) => applyPalette(i),
+  star: () => {
+    const s = orbs.find((o) => o.star);
+    return s ? { x: s.x, y: s.y, m: s.m, r: s.r, vx: s.vx, vy: s.vy } : null;
+  },
+  radii: () => {
+    const s = orbs.find((o) => o.star);
+    if (!s) return [];
+    const out = [];
     for (const o of orbs) {
-      const age = Math.min((now - o.born) / 420, 1);
-      const r = o.r * (0.55 + 0.45 * age);
-      const [cr, cg, cb] = o.col;
-
-      const g = ctx.createRadialGradient(o.x, o.y, 0, o.x, o.y, r * 5.5);
-      g.addColorStop(0.00, `rgba(${cr},${cg},${cb},${0.85 * age})`);
-      g.addColorStop(0.25, `rgba(${cr},${cg},${cb},${0.28 * age})`);
-      g.addColorStop(1.00, `rgba(${cr},${cg},${cb},0)`);
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(o.x, o.y, r * 5.5, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = `rgba(${Math.min(cr + 90, 255)},${Math.min(cg + 90, 255)},${Math.min(cb + 90, 255)},${0.95 * age})`;
-      ctx.beginPath();
-      ctx.arc(o.x, o.y, r, 0, Math.PI * 2);
-      ctx.fill();
+      if (o.star) continue;
+      out.push(Math.hypot(o.x - s.x, o.y - s.y));
     }
-
-    // slingshot aim line
-    if (drag) {
-      const dx = drag.x - drag.cx, dy = drag.y - drag.cy;
-      const dist = Math.hypot(dx, dy);
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = 'rgba(150, 180, 230, 0.5)';
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([6, 6]);
-      ctx.beginPath();
-      ctx.moveTo(drag.x, drag.y);
-      ctx.lineTo(drag.cx, drag.cy);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.arc(drag.x, drag.y, Math.max(dist * 0.06, 5), 0, Math.PI * 2);
-      ctx.stroke();
+    return out;
+  },
+  bounds: () => {
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    for (const o of orbs) {
+      if (o.x < x0) x0 = o.x; if (o.x > x1) x1 = o.x;
+      if (o.y < y0) y0 = o.y; if (o.y > y1) y1 = o.y;
     }
-    ctx.globalCompositeOperation = 'source-over';
+    return { x0, y0, x1, y1, n: orbs.length };
+  },
+};
 
-    if (paused) {
-      ctx.fillStyle = 'rgba(200, 214, 240, 0.75)';
-      ctx.font = '600 15px ui-monospace, Menlo, monospace';
-      ctx.fillText('paused — space to resume', 18, 30);
-    }
+// ---------------------------------------------------------------------------
+//  frame
+// ---------------------------------------------------------------------------
+const DT = 1 / 60;
+
+// The disc thins as orbs merge and get absorbed. A trickle proportional to the
+// deficit means the population returns to its target in a few seconds after a
+// collapse, and the rate eases off as it refills, so it never overshoots into a
+// crowd. This is what stops a long session from ending on an empty screen.
+function trickle(dt) {
+  if (orbs.length === 0) return;
+  const target = seedCount;
+  const deficit = target - orbs.length;
+  if (deficit <= 0) return;
+
+  const rate = Math.max(0.6, Math.min(deficit / 5, 18));
+  trickleAcc += dt * rate;
+  let added = 0;
+  while (trickleAcc >= 1 && added < 24) {
+    trickleAcc -= 1;
+    seedOrb();
+    added++;
+  }
+}
+
+function step(dt) {
+  const n = orbs.length;
+
+  // flash decay belongs to the simulation, not the render loop: otherwise
+  // stepping the sim without rendering (as the test harness does) leaks
+  // flashes forever and the cost grows without bound
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    flashes[i].life -= dt * flashes[i].decay;
+    if (flashes[i].life <= 0) flashes.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 1.6);
+
+  if (n < 2) { trickle(dt); return; }
+  if (n < DIRECT_LIMIT) {
+    directForces(dt);
+    integrate(dt);
+    cullEscaped();
+    collideDirect();
+  } else {
+    buildGrid();
+    gridForces(dt);
+    integrate(dt);
+    cullEscaped();
+    collidePass();
+  }
+  trickle(dt);
+}
+
+// build the instance array: live orbs, then flashes
+function fillInstances(now) {
+  let k = 0;
+  const n = orbs.length;
+  for (let i = 0; i < n; i++) {
+    const o = orbs[i];
+    const age = Math.min((now - o.born) / 420, 1);
+    // Brightness rises with mass so heavy orbs read as hot, but only gently:
+    // a stronger boost pushed merged orbs past the clamp and they came out as
+    // featureless white discs with their colour gone.
+    const bright = (0.55 + 0.45 * age) * (1.0 + Math.min(o.m / 900, 0.35));
+    // Glow radius has to shrink as the orb grows. A fixed multiplier means the
+    // star (r ~ 54px) is drawn with a ~300px halo, which covers most of the
+    // screen and, accumulating every frame, washed the whole thing to white.
+    const glow = o.star ? 1.9 : 5.5 / (1 + o.r / 9);
+    const p = k * FLOATS_PER_INSTANCE;
+    instData[p] = o.x; instData[p + 1] = o.y;
+    instData[p + 2] = o.r * (0.6 + 0.4 * age);
+    instData[p + 3] = o.ci;
+    instData[p + 4] = bright;
+    instData[p + 5] = glow;
+    k++;
+  }
+  for (let i = flashes.length - 1; i >= 0; i--) {
+    const f = flashes[i];
+    if (f.life <= 0) { flashes.splice(i, 1); continue; }
+    const p = k * FLOATS_PER_INSTANCE;
+    instData[p] = f.x; instData[p + 1] = f.y;
+    instData[p + 2] = f.r * (1.0 + (1 - f.life) * f.grow);
+    instData[p + 3] = FLASH_SLOT;
+    instData[p + 4] = f.life * 1.6;
+    instData[p + 5] = 3.2;
+    k++;
+  }
+  return k;
+}
+
+function render(now) {
+  // --- update instance data
+  const count = fillInstances(now);
+  lastInstanceCount = count;
+  if (count > 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, instVBO);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, instData, 0, count * FLOATS_PER_INSTANCE);
   }
 
-  // --- loop ---
-  let last = performance.now();
-  function frame(now) {
-    const dt = Math.min((now - last) / 1000, 1 / 30); // clamp for tab-switch spikes
-    last = now;
-    if (!paused) step(dt);
-    draw(now);
-    requestAnimationFrame(frame);
+  const src = accum === 0 ? sceneA : sceneB;
+  const dst = accum === 0 ? sceneB : sceneA;
+
+  // --- pass 1: fade previous accumulation into the other buffer.
+  // Reading and writing different textures is what lets this pass clamp, and
+  // the clamp is what stops the steady-state runaway that turned the screen
+  // white.
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progFade);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, src.tex);
+  gl.uniform1i(uFade.u_src, 0);
+  gl.uniform1f(uFade.u_fade, tuneFade);
+  gl.uniform1f(uFade.u_max, tuneClamp);
+  drawFullscreen();
+
+  // --- pass 2: additive particles into the same buffer
+  if (count > 0) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(progParticle);
+    gl.uniform2f(uParticle.u_res, W, H);
+    gl.uniform1f(uParticle.u_scale, 1.0);   // per-instance glow now scales the quad
+    gl.uniform1f(uParticle.u_gain, tuneGain);
+    gl.uniform3fv(uParticle.u_pal, PAL_GL);
+    gl.bindVertexArray(VAO);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, count);
+    gl.bindVertexArray(null);
   }
+  gl.disable(gl.BLEND);
+
+  accum ^= 1;
+
+  // --- pass 3: bright pass
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fbo);
+  gl.viewport(0, 0, bloomA.w, bloomA.h);
+  gl.useProgram(progBright);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, dst.tex);
+  gl.uniform1i(uBright.u_src, 0);
+  gl.uniform1f(uBright.u_threshold, 0.62);
+  drawFullscreen();
+
+  // --- pass 4/5: separable blur
+  gl.useProgram(progBlur);
+  gl.uniform1i(uBlur.u_src, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomB.fbo);
+  gl.viewport(0, 0, bloomB.w, bloomB.h);
+  gl.bindTexture(gl.TEXTURE_2D, bloomA.tex);
+  gl.uniform2f(uBlur.u_dir, 1 / bloomA.w, 0);
+  drawFullscreen();
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomA.fbo);
+  gl.bindTexture(gl.TEXTURE_2D, bloomB.tex);
+  gl.uniform2f(uBlur.u_dir, 0, 1 / bloomB.h);
+  drawFullscreen();
+
+  // --- pass 6: tonemap to the screen
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(progTonemap);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, dst.tex);
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, bloomA.tex);
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, starTex);
+  gl.uniform1i(uTonemap.u_scene, 0);
+  gl.uniform1i(uTonemap.u_bloom, 1);
+  gl.uniform1i(uTonemap.u_stars, 2);
+  gl.uniform2f(uTonemap.u_res, W, H);
+  gl.uniform1f(uTonemap.u_bloomAmt, tuneBloomOn ? tuneBloom : 0.0);
+  gl.uniform1f(uTonemap.u_exposure, tuneExposure);
+  gl.uniform1f(uTonemap.u_starAmt, tuneStars);
+  gl.uniform1f(uTonemap.u_shake, shake);
+  gl.uniform1f(uTonemap.u_time, now * 0.001);
+  drawFullscreen();
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+// ---------------------------------------------------------------------------
+//  loop
+// ---------------------------------------------------------------------------
+const fpsEl = document.getElementById('fps');
+const nEl = document.getElementById('n');
+let last = performance.now();
+let fpsAcc = 0, fpsFrames = 0, fpsShown = 0;
+
+function frame(now) {
+  const raw = (now - last) / 1000;
+  last = now;
+  const dt = Math.min(raw, 1 / 30);
+
+  if (!paused) {
+    simTime += dt;
+    step(dt);
+  }
+
+  render(now);
+
+  fpsAcc += raw; fpsFrames++;
+  if (fpsAcc >= 0.4) {
+    fpsShown = Math.round(fpsFrames / fpsAcc);
+    fpsEl.textContent = paused ? 'paused' : fpsShown;
+    nEl.textContent = orbs.length.toLocaleString();
+    fpsAcc = 0; fpsFrames = 0;
+  }
+
   requestAnimationFrame(frame);
+}
+
+// The canvas has to be sized before anything is seeded: the disc is placed
+// relative to W and H, and a first version seeded at the bottom of the script
+// while W was still 1, which put the star at (0.5, 0.5) in the corner.
+allocateTargets();
+window.addEventListener('resize', allocateTargets);
+
+seedDisc(130);
+
+requestAnimationFrame(frame);
+
 })();
 </script>
 </body>
