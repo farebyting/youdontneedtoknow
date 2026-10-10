@@ -1,0 +1,23 @@
+[package]
+name = "flowfield-rs"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated flow field particle painter. Millions of particles, 60fps."
+license = "MIT"
+
+[dependencies]
+wgpu = "30"
+winit = "0.30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[[bin]]
+name = "flowfield"
+path = "src/main.rs"
