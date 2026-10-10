@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>gravity sandbox</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05060a; }
+  canvas { display: block; cursor: crosshair; }
+  #hud {
+    position: fixed; left: 16px; bottom: 14px;
+    font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace;
+    color: #6a7488; pointer-events: none; user-select: none;
+    text-shadow: 0 0 8px #000;
+  }
+  #hud b { color: #9fb0cc; font-weight: 600; }
+  #hud .dim { color: #3d4657; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <b>drag</b> fling an orb &nbsp;·&nbsp; <b>click</b> drop one &nbsp;·&nbsp; <b>space</b> pause &nbsp;·&nbsp; <b>c</b> clear
+  <br><span class="dim">they pull on each other. big ones eat small ones.</span>
+</div>
+<script>
+(() => {
+  'use strict';
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+
+  let W, H, DPR;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  // --- background stars ---
+  const stars = Array.from({ length: 160 }, () => ({
+    x: Math.random(), y: Math.random(),
+    r: Math.random() * 1.1 + 0.2,
+    a: Math.random() * 0.5 + 0.1,
+  }));
+
+  // --- orbs ---
+  const orbs = [];
+  const G = 1400;          // gravitational constant (tuned to feel good)
+  const MAX_ORBS = 220;
+  const SOFTEN = 30;       // prevents infinite force at tiny distances
+
+  const PALETTE = [
+    [ 96, 165, 250], [167, 139, 250], [244, 114, 182],
+    [ 52, 211, 153], [251, 191,  36], [248, 113, 113],
+    [ 34, 211, 238],
+  ];
+
+  function massToRadius(m) { return Math.pow(m, 1 / 3) * 2.6; }
+
+  function spawn(x, y, vx, vy, mass) {
+    if (orbs.length >= MAX_ORBS) orbs.shift();
+    mass = mass || (4 + Math.random() * 10);
+    const col = PALETTE[(Math.random() * PALETTE.length) | 0];
+    orbs.push({
+      x, y, vx: vx || 0, vy: vy || 0,
+      m: mass, r: massToRadius(mass),
+      col, born: performance.now(),
+    });
+  }
+
+  // seed a few so it's alive on open
+  for (let i = 0; i < 7; i++) {
+    spawn(W * (0.2 + 0.6 * Math.random()), H * (0.2 + 0.6 * Math.random()),
+          (Math.random() - 0.5) * 60, (Math.random() - 0.5) * 60,
+          5 + Math.random() * 14);
+  }
+
+  // --- interaction ---
+  let drag = null;       // {x, y, cx, cy}
+  let paused = false;
+
+  function pos(e) {
+    const t = e.touches ? e.touches[0] : e;
+    return { x: t.clientX, y: t.clientY };
+  }
+
+  function down(e) {
+    e.preventDefault();
+    const p = pos(e);
+    drag = { x: p.x, y: p.y, cx: p.x, cy: p.y, t: performance.now() };
+  }
+  function move(e) {
+    if (!drag) return;
+    e.preventDefault();
+    const p = pos(e);
+    drag.cx = p.x; drag.cy = p.y;
+  }
+  function up(e) {
+    if (!drag) return;
+    e.preventDefault();
+    const dx = drag.x - drag.cx;
+    const dy = drag.y - drag.cy;
+    const dt = Math.max((performance.now() - drag.t) / 1000, 0.05);
+    const dist = Math.hypot(dx, dy);
+
+    if (dist < 6) {
+      spawn(drag.x, drag.y, 0, 0, 6 + Math.random() * 10);
+    } else {
+      // slingshot: pull back, launch forward
+      const speed = Math.min(dist * 2.2, 900);
+      spawn(drag.x, drag.y, (dx / dist) * speed, (dy / dist) * speed,
+            6 + Math.min(dist, 200) * 0.08);
+    }
+    drag = null;
+  }
+
+  canvas.addEventListener('mousedown', down);
+  canvas.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', up);
+  canvas.addEventListener('touchstart', down, { passive: false });
+  canvas.addEventListener('touchmove', move, { passive: false });
+  window.addEventListener('touchend', up, { passive: false });
+
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space') { paused = !paused; e.preventDefault(); }
+    if (e.key === 'c' || e.key === 'C') orbs.length = 0;
+  });
+
+  // --- physics ---
+  function step(dt) {
+    const n = orbs.length;
+
+    // pairwise gravity
+    for (let i = 0; i < n; i++) {
+      const a = orbs[i];
+      for (let j = i + 1; j < n; j++) {
+        const b = orbs[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d2 = dx * dx + dy * dy + SOFTEN;
+        const d = Math.sqrt(d2);
+        const f = G / d2;
+        const fx = f * dx / d, fy = f * dy / d;
+        a.vx += fx * b.m * dt; a.vy += fy * b.m * dt;
+        b.vx -= fx * a.m * dt; b.vy -= fy * a.m * dt;
+      }
+    }
+
+    // integrate + walls
+    const REST = 0.82;
+    for (let i = 0; i < n; i++) {
+      const o = orbs[i];
+      o.x += o.vx * dt;
+      o.y += o.vy * dt;
+      if (o.x - o.r < 0)      { o.x = o.r;     o.vx = Math.abs(o.vx) * REST; }
+      if (o.x + o.r > W)      { o.x = W - o.r; o.vx = -Math.abs(o.vx) * REST; }
+      if (o.y - o.r < 0)      { o.y = o.r;     o.vy = Math.abs(o.vy) * REST; }
+      if (o.y + o.r > H)      { o.y = H - o.r; o.vy = -Math.abs(o.vy) * REST; }
+    }
+
+    // merge on overlap (momentum conserved)
+    for (let i = 0; i < orbs.length; i++) {
+      for (let j = i + 1; j < orbs.length; j++) {
+        const a = orbs[i], b = orbs[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const rr = (a.r + b.r) * 0.82;
+        if (dx * dx + dy * dy < rr * rr) {
+          const M = a.m + b.m;
+          a.vx = (a.vx * a.m + b.vx * b.m) / M;
+          a.vy = (a.vy * a.m + b.vy * b.m) / M;
+          a.x = (a.x * a.m + b.x * b.m) / M;
+          a.y = (a.y * a.m + b.y * b.m) / M;
+          a.m = M;
+          a.r = massToRadius(M);
+          orbs.splice(j, 1);
+          j--;
+        }
+      }
+    }
+  }
+
+  // --- render ---
+  function draw(now) {
+    // motion-blur fade: paint bg at low alpha instead of clearing
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = 'rgba(5, 6, 10, 0.28)';
+    ctx.fillRect(0, 0, W, H);
+
+    // stars (redrawn dim, they smear slightly = dreamy)
+    for (const s of stars) {
+      ctx.globalAlpha = s.a * 0.55;
+      ctx.fillStyle = '#c8d6f0';
+      ctx.fillRect(s.x * W, s.y * H, s.r, s.r);
+    }
+    ctx.globalAlpha = 1;
+
+    // orbs, additive glow
+    ctx.globalCompositeOperation = 'lighter';
+    for (const o of orbs) {
+      const age = Math.min((now - o.born) / 420, 1);
+      const r = o.r * (0.55 + 0.45 * age);
+      const [cr, cg, cb] = o.col;
+
+      const g = ctx.createRadialGradient(o.x, o.y, 0, o.x, o.y, r * 5.5);
+      g.addColorStop(0.00, `rgba(${cr},${cg},${cb},${0.85 * age})`);
+      g.addColorStop(0.25, `rgba(${cr},${cg},${cb},${0.28 * age})`);
+      g.addColorStop(1.00, `rgba(${cr},${cg},${cb},0)`);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, r * 5.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = `rgba(${Math.min(cr + 90, 255)},${Math.min(cg + 90, 255)},${Math.min(cb + 90, 255)},${0.95 * age})`;
+      ctx.beginPath();
+      ctx.arc(o.x, o.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // slingshot aim line
+    if (drag) {
+      const dx = drag.x - drag.cx, dy = drag.y - drag.cy;
+      const dist = Math.hypot(dx, dy);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.strokeStyle = 'rgba(150, 180, 230, 0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.moveTo(drag.x, drag.y);
+      ctx.lineTo(drag.cx, drag.cy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.arc(drag.x, drag.y, Math.max(dist * 0.06, 5), 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    if (paused) {
+      ctx.fillStyle = 'rgba(200, 214, 240, 0.75)';
+      ctx.font = '600 15px ui-monospace, Menlo, monospace';
+      ctx.fillText('paused — space to resume', 18, 30);
+    }
+  }
+
+  // --- loop ---
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min((now - last) / 1000, 1 / 30); // clamp for tab-switch spikes
+    last = now;
+    if (!paused) step(dt);
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
